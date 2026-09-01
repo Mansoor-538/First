@@ -1,74 +1,130 @@
-import numpy as np
-import pandas as pd
-import yfinance as yf
-import matplotlib.pyplot as plt
-from pypfopt import EfficientFrontier, risk_models, expected_returns
-from pypfopt.discrete_allocation import DiscreteAllocation, get_latest_prices
+from typing import Dict, List, Optional
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Minimal E-Commerce API")
 
 # ==========================================
-# 1. DOWNLOAD HISTORICAL STOCK DATA
+# 1. SCHEMAS & MODELS (Data Validation)
 # ==========================================
-# Define the tickers in your portfolio
-tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+class Product(BaseModel):
+    id: int
+    name: str
+    price: float = Field(gt=0, description="Price must be greater than zero")
+    category: str
+    stock: int = Field(ge=0, description="Stock cannot be negative")
 
-print(f"Downloading historical data for: {', '.join(tickers)}")
-# Fetch 5 years of daily adjusted closing prices
-data = yf.download(tickers, start="2021-01-01", end="2026-01-01")["Adj Close"]
 
-# Drop missing values
-data = data.dropna()
+class CartItem(BaseModel):
+    product_id: int
+    quantity: int = Field(gt=0, description="Quantity must be at least 1")
 
-# ==========================================
-# 2. CALCULATE EXPECTED RETURNS & RISK
-# ==========================================
-# Calculate annualized expected returns (using historical average)
-mu = expected_returns.mean_historical_return(data)
 
-# Calculate the annualized sample covariance matrix
-S = risk_models.sample_cov(data)
+class OrderSummary(BaseModel):
+    items: List[Dict]
+    subtotal: float
+    tax: float
+    total: float
 
-print("\n--- Expected Annualized Returns ---")
-print(mu)
 
 # ==========================================
-# 3. OPTIMIZE FOR MAX SHARPE RATIO
+# 2. IN-MEMORY DATABASE (Mock Data)
 # ==========================================
-# Initialize the Efficient Frontier object
-ef = EfficientFrontier(mu, S)
+products_db: Dict[int, Product] = {
+    1: Product(id=1, name="Wireless Mouse", price=25.99, category="Electronics", stock=15),
+    2: Product(id=2, name="Mechanical Keyboard", price=89.99, category="Electronics", stock=8),
+    3: Product(id=3, name="Coffee Mug", price=12.50, category="Kitchen", stock=50),
+}
 
-# Optimize the weights to maximize the Sharpe Ratio (risk-free rate defaults to 2%)
-raw_weights = ef.max_sharpe()
+# Mock active cart tracking { user_id: { product_id: quantity } }
+carts_db: Dict[int, Dict[int, int]] = {}
 
-# Clean the weights (rounds off small numbers to 0 and rounds others neatly)
-cleaned_weights = ef.clean_weights()
+TAX_RATE = 0.08  # 8% sales tax
 
-print("\n--- Optimal Portfolio Weights ---")
-for ticker, weight in cleaned_weights.items():
-    print(f"{ticker}: {weight:.2%}")
-
-# Display overall portfolio performance metrics
-print("\n--- Expected Portfolio Performance ---")
-performance = ef.portfolio_performance(verbose=True)
 
 # ==========================================
-# 4. DISCRETE ALLOCATION (Optional)
+# 3. API ENDPOINTS
 # ==========================================
-# Calculate how many actual shares to buy given a specific budget
-portfolio_budget = 100000  # $100,000 USD
-latest_prices = get_latest_prices(data)
 
-da = DiscreteAllocation(cleaned_weights, latest_prices, total_portfolio_value=portfolio_budget)
-allocation, leftover = da.greedy_portfolio()
+# --- Product Catalog Routes ---
+@app.get("/products", response_model=List[Product])
+def get_products():
+    """Retrieve all available products."""
+    return list(products_db.values())
 
-print(f"\n--- Discrete Asset Allocation for ${portfolio_budget:,.2f} Budget ---")
-for ticker, shares in allocation.items():
-    print(f"{ticker}: {shares} shares")
-print(f"Funds remaining: ${leftover:.2f}")
 
-# ==========================================
-# 5. VISUALIZE WEIGHTS
-# ==========================================
-pd.Series(cleaned_weights).plot.pie(figsize=(6, 6), autopct="%1.1f%%")
-plt.title("Optimal Portfolio Weight Allocation")
-plt.ylabel("")
-plt.show()
+@app.get("/products/{product_id}", response_model=Product)
+def get_product(product_id: int):
+    """Retrieve details for a single product."""
+    if product_id not in products_db:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return products_db[product_id]
+
+
+# --- Cart Routing ---
+@app.post("/cart/{user_id}/add", status_code=status.HTTP_200_OK)
+def add_to_cart(user_id: int, item: CartItem):
+    """Add an item to the user's shopping cart."""
+    # Check if product exists
+    if item.product_id not in products_db:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product = products_db[item.product_id]
+
+    # Check stock availability
+    if product.stock < item.quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient stock. Only {product.stock} items left.",
+        )
+
+    # Initialize cart if user is new
+    if user_id not in carts_db:
+        carts_db[user_id] = {}
+
+    # Update or add quantity
+    current_qty = carts_db[user_id].get(item.product_id, 0)
+    if product.stock < (current_qty + item.quantity):
+        raise HTTPException(status_code=400, detail="Cannot exceed available stock")
+
+    carts_db[user_id][item.product_id] = current_qty + item.quantity
+    return {"message": f"Added {item.quantity} x {product.name} to cart"}
+
+
+# --- Checkout & Order Summary ---
+@app.get("/cart/{user_id}/checkout", response_model=OrderSummary)
+def checkout(user_id: int):
+    """Calculate subtotal, tax, and order total for checkout."""
+    user_cart = carts_db.get(user_id)
+    if not user_cart or len(user_cart) == 0:
+        raise HTTPException(status_code=400, detail="Your shopping cart is empty")
+
+    subtotal = 0.0
+    items_summary = []
+
+    # Calculate individual line items and subtotal
+    for prod_id, qty in user_cart.items():
+        product = products_db[prod_id]
+        item_total = product.price * qty
+        subtotal += item_total
+
+        items_summary.append(
+            {
+                "product_id": prod_id,
+                "name": product.name,
+                "unit_price": product.price,
+                "quantity": qty,
+                "item_total": round(item_total, 2),
+            }
+        )
+
+    # Apply global calculations
+    tax = subtotal * TAX_RATE
+    total = subtotal + tax
+
+    return OrderSummary(
+        items=items_summary,
+        subtotal=round(subtotal, 2),
+        tax=round(tax, 2),
+        total=round(total, 2),
+    )
